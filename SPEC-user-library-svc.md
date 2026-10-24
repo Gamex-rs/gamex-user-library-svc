@@ -12,10 +12,11 @@ The User Library Service is the identity provider and user-data owner for Gamex.
 
 - User registration, authentication, and JWT issuance
 - User profiles
-- Each user's personal game library (owned, wishlist, for exchange, for sale, want to buy)
+- Each user's personal game library (owned, wishlist, for exchange, for sale, want to buy) — entries are per game + platform + format, so the same game can be held on several platforms/formats
 - Public listings derived from library entries
 - User-to-user ratings after completed transactions
 - Publishing `library.game.status.changed` events to SQS so the Game Catalog Service can maintain aggregate stats
+- Maintaining a **read-only replica** of game and platform metadata, consumed from the Game Catalog Service's `gamex-catalog-events` queue. The Game Catalog Service remains the source of truth; this service never edits game data and never accepts game metadata from the client.
 
 ---
 
@@ -30,6 +31,7 @@ The User Library Service is the identity provider and user-data owner for Gamex.
 | Auth | ASP.NET Core Identity + custom JWT (RS256) |
 | OAuth | Google & Facebook — Authorization Code Flow, server-side exchange |
 | SQS Publisher | AWSSDK.SQS |
+| SQS Consumer | AWSSDK.SQS + background `IHostedService` (catalog replica) |
 | Config / Secrets | AWS SSM Parameter Store + Secrets Manager (env vars locally) |
 
 ---
@@ -73,7 +75,7 @@ Base path: `/api/v1`
 }
 ```
 
-`platformIds` is optional at registration — the user can skip platform selection and set it later from profile settings. Platform IDs reference the `platforms` table in the Game Catalog Service; the frontend provides them after fetching `GET /api/v1/platforms` from the Game Catalog Service.
+`platformIds` is optional at registration — the user can skip platform selection and set it later from profile settings. Platform IDs reference the `platforms` table in the Game Catalog Service; the frontend gets them from `GET /api/v1/platforms` (Game Catalog Service). Each ID is validated against the local `catalog_platforms` replica — unknown IDs return `400`.
 
 Returns `201` with JWT pair on success. Returns `409` if email already exists.
 
@@ -119,16 +121,20 @@ Returns `201` with JWT pair on success. Returns `409` if email already exists.
 
 ### 4.3 Game Library
 
-Each user has a library of entries, one per game. An entry tracks all statuses for that user-game pair and stores a snapshot of key game metadata.
+Each user has a library of entries. An entry represents one **copy** of a game, identified by the combination of **game + platform + format**. The user **must** select the platform (and format) when adding a game. The same game can appear multiple times in a user's library as long as each entry differs in platform or format — e.g. *Elden Ring / PS5 / physical* (owned) and *Elden Ring / PC / digital* (wishlist) are two separate entries.
+
+Each entry tracks all statuses for that copy. It stores only references (`gameId`, `platformId`) — game title, cover, release date, score and platform names are read at query time by joining the local catalog replica (`catalog_games`, `catalog_platforms`, see §5), so they always reflect the latest catalog data. `isOwned` and `isWishlist` are independent flags and **may both be `true` on the same entry** (e.g. the user owns the game but also keeps it on the wishlist).
+
+**Entry uniqueness:** `(userId, gameId, platformId, format)` must be unique. Attempting to create (or update an entry into) a combination that already exists returns `409 Conflict` with the existing `entryId` in the problem details.
 
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| `GET` | `/users/me/library` | Bearer | Own library (filterable by status) |
+| `GET` | `/users/me/library` | Bearer | Own library (filterable by status, `gameId`, `platformId`, `format`) |
 | `GET` | `/users/me/library/statuses` | Bearer | Batch status lookup for a list of game IDs |
 | `GET` | `/users/{id}/library` | None | Public library entries (only active listings) |
-| `POST` | `/users/me/library` | Bearer | Add game to library |
-| `PUT` | `/users/me/library/{entryId}` | Bearer | Update statuses or listing details |
-| `DELETE` | `/users/me/library/{entryId}` | Bearer | Remove game from library |
+| `POST` | `/users/me/library` | Bearer | Add a game copy (game + platform + format) to library |
+| `PUT` | `/users/me/library/{entryId}` | Bearer | Update statuses, platform/format, or listing details |
+| `DELETE` | `/users/me/library/{entryId}` | Bearer | Remove a single entry (copy) from library |
 
 #### `GET /users/me/library/statuses` — Query Parameters & Response
 
@@ -139,34 +145,45 @@ Query: `?gameIds=uuid1,uuid2,uuid3` (comma-separated, max 50 IDs per request)
 Response:
 ```json
 {
-  "uuid1": { "isOwned": true,  "isWishlist": false },
-  "uuid2": { "isOwned": false, "isWishlist": true  },
+  "uuid1": {
+    "isOwned": true,
+    "isWishlist": true,
+    "entries": [
+      { "entryId": "uuid", "platformId": "uuid", "platformName": "PlayStation 5", "platformSlug": "playstation5", "format": "physical", "isOwned": true,  "isWishlist": false },
+      { "entryId": "uuid", "platformId": "uuid", "platformName": "PC",            "platformSlug": "pc",           "format": "digital",  "isOwned": false, "isWishlist": true  }
+    ]
+  },
+  "uuid2": {
+    "isOwned": true,
+    "isWishlist": true,
+    "entries": [
+      { "entryId": "uuid", "platformId": "uuid", "platformName": "PlayStation 5", "platformSlug": "playstation5", "format": "digital", "isOwned": true, "isWishlist": true }
+    ]
+  },
   "uuid3": null
 }
 ```
 
-`null` means the game is not in the user's library at all. The frontend uses this to render an "Owned" or "Wishlist" badge on the game card.
+- Top-level `isOwned` / `isWishlist` are aggregates: `true` if **any** entry for that game has the flag set. Both can be `true` at the same time.
+- `entries` lists every copy of the game in the user's library so the frontend can show which platform/format is owned or wishlisted.
+- `null` means the game is not in the user's library at all.
+
+The frontend uses this to render "Owned" and/or "Wishlist" badges (with platform labels) on the game card.
 
 #### `POST /users/me/library` — Request
 
-The frontend provides both the `gameId` and the denormalized game snapshot. The snapshot is captured at the moment the user adds the game so the library entry is self-contained and does not depend on the Game Catalog Service at read time.
+The frontend sends only identifiers and user-owned data. No game metadata is accepted from the client — it comes from the catalog replica.
 
 ```json
 {
   "gameId": "uuid",
-  "gameSnapshot": {
-    "title": "string",
-    "releaseDate": "2024-11-12",
-    "score": 90,
-    "platforms": ["PS5", "PC"],
-    "coverImageUrl": "string"
-  },
+  "platformId": "uuid",
+  "format": "physical",
   "isOwned": true,
-  "isWishlist": false,
+  "isWishlist": true,
   "forExchange": false,
   "forSale": false,
   "wantToBuy": false,
-  "format": "physical",
   "condition": "like_new",
   "price": null,
   "preferredGames": null,
@@ -174,11 +191,47 @@ The frontend provides both the `gameId` and the denormalized game snapshot. The 
 }
 ```
 
-`format`, `condition`, `price`, `preferredGames`, and `notes` are only relevant when `forExchange` or `forSale` is true and apply to the listing created from this entry.
+Validation rules:
+- `gameId` must exist in `catalog_games`. If it does not (the `catalog.game.upserted` event for a just-imported game has not been consumed yet) → `409 Conflict` with problem type `https://gamex.rs/errors/game-not-synced` and a `Retry-After: 2` header. The frontend retries automatically (see Frontend spec). This only happens in the first seconds after a game is imported from RAWG.
+- `platformId` is **required** and must be one of the game's platforms in `catalog_game_platforms`; otherwise `400 Bad Request`.
+- `format` is **required** (`physical` or `digital`) — it is part of the entry's identity, not only a listing detail.
+- `isOwned` and `isWishlist` are independent; both may be `true`.
+- If an entry with the same `(gameId, platformId, format)` already exists for the user → `409 Conflict`.
+- `condition` is only allowed when `format = physical`.
+- `condition`, `price`, `preferredGames`, and `notes` are only relevant when `forExchange` or `forSale` is true and apply to the listing created from this entry.
 
 #### `PUT /users/me/library/{entryId}` — Request
 
-Same shape as POST but all fields optional (partial update). Status changes are diffed against current state to compute the SQS delta event.
+Same shape as POST but all fields optional (partial update); `gameId` cannot be changed. `platformId` and `format` may be changed, subject to the same validation and uniqueness rules (`409` if the new combination already exists). Status changes are diffed against current state to compute the SQS delta event (see §6).
+
+#### Library entry — Response shape
+
+`GET /users/me/library`, `GET /users/{id}/library`, the listing endpoints, and the POST/PUT responses return entries with game and platform data joined from the replica:
+
+```json
+{
+  "entryId": "uuid",
+  "game": {
+    "id": "uuid",
+    "title": "Elden Ring",
+    "coverImageUrl": "https://media.gamex.rs/game-covers/326243.jpg",
+    "releaseDate": "2022-02-25",
+    "metacritic": 96
+  },
+  "platform": { "id": "uuid", "name": "PlayStation 5", "slug": "playstation5" },
+  "format": "physical",
+  "isOwned": true,
+  "isWishlist": true,
+  "forExchange": false,
+  "forSale": false,
+  "wantToBuy": false,
+  "condition": "like_new",
+  "price": null,
+  "preferredGames": null,
+  "notes": "string",
+  "listingStatus": "none"
+}
+```
 
 ### 4.4 Listings
 
@@ -197,7 +250,8 @@ Listings are derived views of library entries where `forExchange=true` or `forSa
 |---|---|---|
 | `type` | string | `exchange`, `sale`, `want_to_buy` |
 | `gameId` | GUID | Filter by specific game |
-| `platform` | string | Platform slug |
+| `platform` | string | Platform slug — resolved via `catalog_platforms` and matched against the entry's selected platform (`library_entries.platform_id`) |
+| `q` | string | Game title search (partial match on `catalog_games.title`) |
 | `format` | string | `physical`, `digital` |
 | `condition` | string | `new`, `like_new`, `good`, `acceptable` |
 | `city` | string | User's city |
@@ -235,20 +289,16 @@ Both parties must call this endpoint. When both have called it, the transaction 
 
 ### `user_platforms`
 
-Stores a user's platform preferences. Each row is one platform the user is interested in. Platform IDs are shared identifiers with the Game Catalog Service (`platforms` table) — no foreign key across services.
+Stores a user's platform preferences. Each row is one platform the user is interested in. Platform IDs are shared identifiers with the Game Catalog Service (`platforms` table). Name and slug are read by joining `catalog_platforms` (local replica).
 
 | Column | Type | Notes |
 |---|---|---|
 | `user_id` | CHAR(36) FK → users.id | |
-| `platform_id` | CHAR(36) | Reference to Game Catalog `platforms.id` |
-| `platform_name` | VARCHAR(100) | Denormalized snapshot of platform name |
-| `platform_slug` | VARCHAR(100) | Denormalized snapshot of platform slug |
+| `platform_id` | CHAR(36) FK → catalog_platforms.id | Reference to Game Catalog `platforms.id` via the local replica |
 | `created_at` | DATETIME | |
 | PK | `(user_id, platform_id)` | |
 
-The `platform_name` and `platform_slug` columns are denormalized so the User Library Service can return platform preferences without calling the Game Catalog Service. They are set at insert time from data provided by the frontend and are not updated if the platform name changes (platform names are stable).
-
-`PUT /users/me/platforms` replaces the full set for the user — delete all existing rows for the user, insert the new set within a single transaction.
+`PUT /users/me/platforms` replaces the full set for the user — delete all existing rows for the user, insert the new set within a single transaction. Unknown platform IDs return `400`.
 
 #### `GET /users/me/platforms` — Response
 
@@ -263,14 +313,11 @@ The `platform_name` and `platform_slug` columns are denormalized so the User Lib
 
 ```json
 {
-  "platforms": [
-    { "platformId": "uuid", "name": "PlayStation 5", "slug": "playstation5" },
-    { "platformId": "uuid", "name": "PC",             "slug": "pc"           }
-  ]
+  "platformIds": ["uuid", "uuid"]
 }
 ```
 
-An empty `platforms` array clears all preferences (user sees all games, unfiltered).
+An empty `platformIds` array clears all preferences (user sees all games, unfiltered).
 
 ---
 
@@ -296,24 +343,20 @@ An empty `platforms` array clears all preferences (user sees all games, unfilter
 
 ### `library_entries`
 
-One row per user-game pair. A game can only appear once per user; statuses are boolean flags on the same row.
+One row per user + game + platform + format (one "copy"). The same game can appear multiple times per user when platform or format differ; statuses are boolean flags on the row. `is_owned` and `is_wishlist` are independent and may both be true.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | CHAR(36) PK | |
 | `user_id` | CHAR(36) FK → users.id | |
-| `game_id` | CHAR(36) | Reference to Game Catalog (no FK across services) |
-| `game_title` | VARCHAR(255) | Snapshot from frontend at creation |
-| `game_release_date` | DATE | Snapshot |
-| `game_score` | DECIMAL(4,1) | Snapshot (metacritic / RAWG score) |
-| `game_platforms` | JSON | Snapshot e.g. `["PS5","PC"]` |
-| `game_cover_url` | VARCHAR(500) | Snapshot (Cloudflare CDN URL) |
+| `game_id` | CHAR(36) FK → catalog_games.id | Game Catalog `games.id`, via the local replica |
+| `platform_id` | CHAR(36) FK → catalog_platforms.id | **Not null.** Platform the user has / wants this copy on |
+| `format` | ENUM(`physical`,`digital`) | **Not null.** Part of the entry identity |
 | `is_owned` | BOOLEAN | Default false |
 | `is_wishlist` | BOOLEAN | Default false |
 | `for_exchange` | BOOLEAN | Default false |
 | `for_sale` | BOOLEAN | Default false |
 | `want_to_buy` | BOOLEAN | Default false |
-| `format` | ENUM(`physical`,`digital`) | Null if no active listing |
 | `condition` | ENUM(`new`,`like_new`,`good`,`acceptable`) | Physical only |
 | `price` | DECIMAL(10,2) | For sale listings |
 | `preferred_games` | TEXT | For exchange listings — free text |
@@ -322,7 +365,45 @@ One row per user-game pair. A game can only appear once per user; statuses are b
 | `listing_expires_at` | DATETIME | Set when for_exchange or for_sale = true |
 | `created_at` | DATETIME | |
 | `updated_at` | DATETIME | |
-| UNIQUE | `(user_id, game_id)` | One entry per user-game pair |
+| UNIQUE | `(user_id, game_id, platform_id, format)` | One entry per user + game + platform + format |
+| INDEX | `(user_id, game_id)` | Batch status lookup / aggregate delta calculation |
+| INDEX | `(platform_id, listing_status)` | Listing platform filter |
+
+### Catalog replica tables
+
+Read-only local copy of the Game Catalog Service data this service needs. Written **only** by the `gamex-catalog-events` consumer (§6) — never by API requests. Contains every game the catalog has imported (not the whole RAWG database), and only the fields needed to render library entries and listings; description, genres and stats stay in the Game Catalog Service.
+
+#### `catalog_games`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | CHAR(36) PK | Same ID as Game Catalog `games.id` |
+| `title` | VARCHAR(255) | Not null |
+| `cover_image_url` | VARCHAR(500) | Cloudflare CDN URL |
+| `release_date` | DATE | |
+| `metacritic` | SMALLINT | |
+| `source_updated_at` | DATETIME(6) | Game Catalog `games.updated_at` from the event — used to discard stale events |
+| `synced_at` | DATETIME | When this row was last written by the consumer |
+| INDEX | `(title)` | Listing title search |
+
+#### `catalog_platforms`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | CHAR(36) PK | Same ID as Game Catalog `platforms.id` |
+| `name` | VARCHAR(100) | e.g. `PlayStation 5` |
+| `slug` | VARCHAR(100) UNIQUE | e.g. `playstation5` |
+| `source_updated_at` | DATETIME(6) | |
+
+#### `catalog_game_platforms`
+
+| Column | Type | Notes |
+|---|---|---|
+| `game_id` | CHAR(36) FK → catalog_games.id | |
+| `platform_id` | CHAR(36) FK → catalog_platforms.id | |
+| PK | `(game_id, platform_id)` | |
+
+Used to validate that a library entry's platform is one the game is available on.
 
 ### `listing_completions`
 
@@ -351,9 +432,30 @@ Tracks which parties have confirmed a transaction as complete.
 
 ---
 
-## 6. SQS Event Publishing
+## 6. SQS Events
 
-This service publishes to two SQS queues.
+This service publishes to two SQS queues and consumes one.
+
+### Consumed queue: `gamex-catalog-events`
+
+Published by the Game Catalog Service. Keeps the catalog replica tables up to date. Consumer is a background `IHostedService` with long polling (20s), up to 3 receives before the message moves to `gamex-catalog-events-dlq`.
+
+| Event type | Action |
+|---|---|
+| `catalog.platform.upserted` | Upsert `catalog_platforms` row |
+| `catalog.game.upserted` | Upsert `catalog_games` row and replace its `catalog_game_platforms` rows (single transaction) |
+
+Payloads are defined in the Game Catalog Service spec (§6).
+
+**Idempotency & ordering:** an upsert is applied only if the event's `updatedAt` is newer than the stored `source_updated_at`; otherwise the message is acknowledged and ignored. Duplicates and out-of-order delivery are therefore harmless.
+
+**Unknown platform:** if a `catalog.game.upserted` event references a platform ID not yet in `catalog_platforms`, the message is not acknowledged (redelivered after the visibility timeout) so the platform event can arrive first; after 3 receives it goes to the DLQ.
+
+**Initial fill / recovery:** on first deploy, or after DLQ incidents, an admin triggers the Game Catalog Service's replay endpoint (`POST /admin/catalog-events/replay`), which republishes all platforms and games. Because upserts are idempotent, replaying is always safe.
+
+**Platform removed from a game:** platform changes on a game (e.g. a platform removed from a game in the catalog) do **not** delete existing library entries — entries keep their `platform_id`; the platform is only enforced when creating or changing an entry.
+
+### Published queues
 
 ### Queue: `gamex-library-events`
 
@@ -377,10 +479,20 @@ Published whenever a library entry's status flags change (create, update, or del
 }
 ```
 
-Delta calculation rules:
-- On **create**: each `true` flag contributes `+1` to its field
-- On **update**: diff old flags vs new flags; changed flags contribute `+1` or `-1`
-- On **delete**: each `true` flag contributes `-1`
+Game Catalog stats count **users**, not copies (e.g. "142 users own this"). Because a user can have several entries for the same game (different platform/format), the delta is computed on the **user-game aggregate**, not on the single entry:
+
+1. Before the write, compute the aggregate flags for `(user_id, game_id)` across all the user's entries for that game — a flag is `true` if **any** entry has it set.
+2. Apply the create / update / delete.
+3. Recompute the aggregate flags for `(user_id, game_id)`.
+4. Each flag that went `false → true` contributes `+1`; each flag that went `true → false` contributes `-1`; unchanged flags contribute `0`.
+5. If all deltas are `0`, no event is published.
+
+Examples:
+- User owns *Elden Ring / PS5 / physical* and adds *Elden Ring / PC / digital* as owned → aggregate `owned` was already `true` → no `owned` delta.
+- User deletes their only owned copy of a game → `owned: -1`.
+- User sets both `isOwned` and `isWishlist` on a new entry for a game not yet in the library → `owned: +1, wishlist: +1`.
+
+Steps 1–3 run inside the same database transaction as the write.
 
 ### Queue: `gamex-activity-events`
 
@@ -388,7 +500,9 @@ Published for events the Notification Service needs to act on.
 
 | Event type | When | Key payload fields |
 |---|---|---|
-| `listing.created` | Entry transitions to `for_exchange` or `for_sale` | `listingId`, `gameId`, `userId`, `type` |
+| `listing.created` | Entry transitions to `for_exchange` or `for_sale` | `listingId`, `gameId`, `userId`, `type`, `platformId`, `platformSlug`, `format` |
+
+**Wishlist matching:** when resolving wishlist matches for a new listing, a user matches only if they have an entry with `is_wishlist = true` for the same `game_id` **and** the same `platform_id` as the listing. Format is not required to match.
 | `listing.expired` | Background job marks listing as expired | `listingId`, `userId` |
 | `transaction.completed` | Both parties confirm | `listingEntryId`, `userIdA`, `userIdB` |
 
@@ -421,6 +535,7 @@ services:
       - FACEBOOK_APP_SECRET=${FACEBOOK_APP_SECRET}
       - SQS_LIBRARY_EVENTS_URL=http://localstack:4566/000000000000/gamex-library-events
       - SQS_ACTIVITY_EVENTS_URL=http://localstack:4566/000000000000/gamex-activity-events
+      - SQS_CATALOG_EVENTS_URL=http://localstack:4566/000000000000/gamex-catalog-events
       - FRONTEND_BASE_URL=http://localhost:5173
     depends_on:
       - library-db
@@ -464,5 +579,6 @@ volumes:
 | `FACEBOOK_APP_SECRET` | Facebook app secret | Secrets Manager |
 | `SQS_LIBRARY_EVENTS_URL` | Queue URL for game stats updates | SSM Parameter Store |
 | `SQS_ACTIVITY_EVENTS_URL` | Queue URL for notification events | SSM Parameter Store |
+| `SQS_CATALOG_EVENTS_URL` | Queue URL to consume catalog replica events | SSM Parameter Store |
 | `FRONTEND_BASE_URL` | Used for OAuth redirect URIs | SSM Parameter Store |
 | `ASPNETCORE_ENVIRONMENT` | `Development` / `Production` | ECS task definition |
