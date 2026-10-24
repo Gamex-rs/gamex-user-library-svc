@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Gamex.UserLibrary.Api/Gamex.UserLibrary.Api.csproj" />
+    <Project Path="src/Gamex.UserLibrary.Application/Gamex.UserLibrary.Application.csproj" />
+    <Project Path="src/Gamex.UserLibrary.Domain/Gamex.UserLibrary.Domain.csproj" />
+    <Project Path="src/Gamex.UserLibrary.Infrastructure/Gamex.UserLibrary.Infrastructure.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Gamex.UserLibrary.IntegrationTests/Gamex.UserLibrary.IntegrationTests.csproj" />
+    <Project Path="tests/Gamex.UserLibrary.UnitTests/Gamex.UserLibrary.UnitTests.csproj" />
+  </Folder>
+</Solution>

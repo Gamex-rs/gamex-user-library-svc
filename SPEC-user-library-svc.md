@@ -500,11 +500,11 @@ Published for events the Notification Service needs to act on.
 
 | Event type | When | Key payload fields |
 |---|---|---|
-| `listing.created` | Entry transitions to `for_exchange` or `for_sale` | `listingId`, `gameId`, `userId`, `type`, `platformId`, `platformSlug`, `format` |
+| `listing.created` | Entry becomes offered (exchange or sale) — one event **per wishlist match** | `listingId`, `gameId`, `gameTitle`, `userId`, `sellerName`, `listingType` (`exchange`/`sale`), `platformId`, `platformSlug`, `format`, `notifyUserId`, `occurredAt` |
 
 **Wishlist matching:** when resolving wishlist matches for a new listing, a user matches only if they have an entry with `is_wishlist = true` for the same `game_id` **and** the same `platform_id` as the listing. Format is not required to match.
-| `listing.expired` | Background job marks listing as expired | `listingId`, `userId` |
-| `transaction.completed` | Both parties confirm | `listingEntryId`, `userIdA`, `userIdB` |
+| `listing.expired` | Background job marks listing as expired | `listingId`, `gameTitle`, `userId`, `expiresAt`, `occurredAt` |
+| `transaction.completed` | Both parties confirm | `transactionId`, `listingEntryId`, `gameTitle`, `userIdA`, `userNameA`, `userIdB`, `userNameB`, `occurredAt` |
 
 ---
 
@@ -582,3 +582,69 @@ volumes:
 | `SQS_CATALOG_EVENTS_URL` | Queue URL to consume catalog replica events | SSM Parameter Store |
 | `FRONTEND_BASE_URL` | Used for OAuth redirect URIs | SSM Parameter Store |
 | `ASPNETCORE_ENVIRONMENT` | `Development` / `Production` | ECS task definition |
+
+---
+
+## 11. Implementation Notes (2026-10-24)
+
+Decisions taken while implementing; they refine the sections above.
+
+### 11.1 Tokens and sessions
+
+- **Access token** claims: `sub`, `email`, `name`, `role`, `jti`, plus `iss` = `JWT_ISSUER` (default `gamex-user-library`) and `aud` = `JWT_AUDIENCE` (default `gamex`). Other services should validate `iss`/`aud` with the same values.
+- **Login / register / refresh response**: `{ accessToken, refreshToken, expiresIn, user }` where `user` is the own profile (`GET /users/me` shape: `id, email, displayName, avatarUrl, city, region, country, bio, role, memberSince, ratingAvg, ratingCount, platformIds, hasPassword`). Register returns `201`.
+- The refresh token is **also** set as an `HttpOnly; Secure; SameSite=Lax` cookie `gx_refresh` on path `/api/v1/auth`. `POST /auth/refresh` and `/auth/logout` accept it from the JSON body (`{ "refreshToken" }`) or the cookie.
+- **Reuse detection**: presenting an already-rotated refresh token revokes all of the user's sessions. Password reset and account deactivation also revoke all sessions.
+- Login failures return one generic `401` message for unknown email, wrong password, OAuth-only and deactivated accounts. Credential endpoints are rate limited per IP (`AUTH_RATE_LIMIT_PER_MINUTE`, default 20).
+- **Passwords**: 8–128 characters, hashed with ASP.NET Core Identity's PBKDF2 `PasswordHasher` (no Identity tables).
+- **Forgot password** always returns `202`; the reset link `{FRONTEND_BASE_URL}/reset-password?token=…` is valid 1 hour and single-use. Email delivery is not wired yet (logged); an email provider (e.g. SES) is a follow-up.
+- `PUT /users/me/password` body: `{ currentPassword, newPassword }`. OAuth-only accounts set a first password via the reset flow.
+- In Development without `JWT_PRIVATE_KEY`, an ephemeral key is generated and its public key is logged at startup.
+
+### 11.2 OAuth (Google, Facebook)
+
+- `GET /auth/oauth/{provider}?redirect=/path` stores a random `state` (CSRF) and the post-login path in an HttpOnly cookie (10 min) and redirects to the provider. Only same-app relative paths are accepted as `redirect`.
+- The callback redirects to `{FRONTEND_BASE_URL}/auth/callback#token=…&refreshToken=…&expiresIn=…&redirect=…` — tokens are in the **URL fragment**, which browsers never send to servers. Errors: `…/auth/callback#error=<code>` (`access_denied`, `invalid_state`, `exchange_failed`, `email_required`, `account_deactivated`, `unknown_provider`).
+- Account resolution: existing provider link → that user; else a **provider-verified** email that matches an existing user → link it; else create a new user. Unverified emails are never linked.
+- Redirect URI: `{PUBLIC_API_BASE_URL}/api/v1/auth/oauth/{provider}/callback` (falls back to the request host).
+
+### 11.3 Library entries
+
+- `POST` requires `gameId`, `platformId`, `format` and at least one status. `condition` only for physical copies; `price` required when `forSale` (0–1,000,000, 2 decimals); text fields ≤ 2000.
+- `PUT` is partial: omitted/`null` = unchanged, `""` clears a text field. `gameId` cannot change.
+- Enums are snake_case strings in JSON and query strings (`physical`, `like_new`, `want_to_buy`).
+- Listing lifecycle: an entry with any of `forExchange`/`forSale`/`wantToBuy` gets an **active listing** for `LISTING_LIFETIME_DAYS` (default 30). Expiry and completion **clear** those flags (so catalog stats drop and relisting is explicit) and keep the status `expired`/`completed`. Want-to-buy listings appear in `/listings?type=want_to_buy` but never trigger wishlist notifications.
+- Wishlist matching: one `listing.created` per active user with a wishlist entry for the same game **and platform**; if a copy is offered for both exchange and sale, `listingType` is `sale`.
+
+### 11.4 Listings, completion and ratings
+
+- `GET /listings` returns `{ items, nextCursor }`; items have `id, types[], game, platform, format, condition, price, preferredGames, notes, status, listedAt, expiresAt, seller{ id, displayName, avatarUrl, city, ratingAvg, ratingCount }`. Newest first; cursor = keyset on (`listed_at`, `id`). Extra filter: `q` (title).
+- `GET /listings/{id}` returns `{ listing, contactToken }`. The **contact token** is an RS256 JWT (`typ` `gx-contact+jwt`, `aud` `gamex-listing-contact`, 24 h) with `listing_id`, `owner_id`, `owner_name`, `owner_avatar`, `game_title`. The Messaging Service verifies it with `JWT_PUBLIC_KEY` to learn the listing owner and title without a synchronous call.
+- `POST /listings/{id}/complete` body `{ partnerUserId? }`: the **owner must name** the partner; the partner confirms without a body. When both confirmed each other, a `transactions` row is created, the listing completes and `transaction.completed` is published. Response `{ completed, transactionId, waitingForUserId }`.
+- `POST /users/{id}/ratings` body `{ transactionId, score (1–5), comment? }` — only the two parties of that transaction, once each (`409` on repeat, `403` otherwise). `GET /users/{id}/ratings` is cursor-paged.
+- `GET /users/{id}/library` and `GET /users/{id}/listings` both return the user's active listings.
+
+### 11.5 Additional tables
+
+| Table | Purpose |
+|---|---|
+| `users.role` | `user` / `admin` (VARCHAR(20)) |
+| `password_reset_tokens` | `id, user_id, token_hash (SHA-256, unique), created_at, expires_at, used_at` |
+| `transactions` | `id, library_entry_id (no FK — survives entry deletion), game_id, owner_id, partner_id, completed_at` |
+| `listing_completions` | adds `listed_at` (listing cycle) and `partner_user_id`; unique `(library_entry_id, listed_at, user_id)` |
+| `user_ratings` | `transaction_id` FK instead of `library_entry_id`; unique `(rater_id, transaction_id)` |
+| `library_entries` | adds `listed_at`; enums stored as VARCHAR(20) snake_case |
+
+### 11.6 Additional environment variables
+
+| Variable | Description |
+|---|---|
+| `JWT_PRIVATE_KEY_PATH` | Alternative to `JWT_PRIVATE_KEY` (PEM file) |
+| `JWT_ISSUER` / `JWT_AUDIENCE` | Token `iss` / `aud` (defaults `gamex-user-library` / `gamex`) |
+| `SQS_CATALOG_EVENTS_URL` | Catalog replica queue (consumed) |
+| `SQS_RETRY_DELAY_SECONDS` | Redelivery delay for a game event whose platform has not arrived (default 30) |
+| `PUBLIC_API_BASE_URL` | Public API origin for OAuth redirect URIs |
+| `LISTING_LIFETIME_DAYS` | Listing lifetime before expiry (default 30) |
+| `LISTING_EXPIRY_ENABLED` | Run the hourly expiry job (default true; one instance via MySQL `GET_LOCK`) |
+| `AUTH_RATE_LIMIT_PER_MINUTE` | Per-IP limit on credential endpoints (default 20) |
+| `DB_MIGRATE_ON_STARTUP` | Apply migrations at startup (default true in Development) |
